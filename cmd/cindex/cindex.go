@@ -14,6 +14,7 @@ import (
 	"sort"
 
 	"github.com/google/codesearch/index"
+	"github.com/google/codesearch/regexp"
 )
 
 var usageMessage = `usage: cindex [-list] [-reset] [path...]
@@ -41,7 +42,7 @@ itself is a useful command to run in a nightly cron job.
 
 The -list flag causes cindex to list the paths it has indexed and exit.
 
-By default cindex adds the named paths to the index but preserves 
+By default cindex adds the named paths to the index but preserves
 information about other paths that might already be indexed
 (the ones printed by cindex -list).  The -reset flag causes cindex to
 delete the existing index before indexing the new paths.
@@ -53,7 +54,21 @@ func usage() {
 	os.Exit(2)
 }
 
+type arrayStringFlags []string
+
+func (a *arrayStringFlags) String() string {
+	return fmt.Sprintf("%v", *a)
+}
+
+func (a *arrayStringFlags) Set(value string) error {
+	*a = append(*a, value)
+
+	return nil
+}
+
 var (
+	excludePatterns arrayStringFlags
+
 	listFlag    = flag.Bool("list", false, "list indexed paths and exit")
 	resetFlag   = flag.Bool("reset", false, "discard existing index")
 	verboseFlag = flag.Bool("verbose", false, "print extra information")
@@ -61,7 +76,17 @@ var (
 )
 
 func main() {
-	flag.Usage = usage
+	excludePatterns = append(excludePatterns, []string{
+		"/.git$",
+		"/node_modules",
+		"/bazel-(bin|out|testlogs)",
+		"/venv",
+		"/.csearchindex",
+		".*/go/pkg/mod",
+	}...)
+	flag.Var(&excludePatterns, "exclude", "re2 patterns to ignore")
+
+	// flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
 
@@ -121,12 +146,42 @@ func main() {
 		file += "~"
 	}
 
+	excludeRegexp := make([]*regexp.Regexp, len(excludePatterns))
+	for i, pattern := range excludePatterns {
+		r, err := regexp.Compile(pattern)
+		if err != nil {
+			panic(err)
+		}
+
+		excludeRegexp[i] = r
+	}
+
+	anyRegexpMatches := func(p string) bool {
+		var anyMatches = false
+		for _, r := range excludeRegexp {
+			if r.MatchString(p, true, true) > 0 {
+				anyMatches = true
+				break
+			}
+		}
+
+		return anyMatches
+	}
+
 	ix := index.Create(file)
 	ix.Verbose = *verboseFlag
 	ix.AddPaths(args)
 	for _, arg := range args {
 		log.Printf("index %s", arg)
 		filepath.Walk(arg, func(path string, info os.FileInfo, err error) error {
+			// Does it match any of our exclude regexes?
+			if info.IsDir() && anyRegexpMatches(path) {
+				if *verboseFlag {
+					log.Printf("skipping dir (due to exclusion): %v\n", path)
+				}
+				return filepath.SkipDir
+			}
+
 			if _, elem := filepath.Split(path); elem != "" {
 				// Skip various temporary or "hidden" files or directories.
 				if elem[0] == '.' || elem[0] == '#' || elem[0] == '~' || elem[len(elem)-1] == '~' {
